@@ -5,7 +5,7 @@ date: "2025-12-22"
 ---
 
 ## Load Library
-```{r, eval=FALSE, echo =FALSE, message=FALSE}
+```{r, eval=FALSE, echo =FALSE, message=FALSE, warning=FALSE}
 library(rpx)
 library(msdata)
 library(Spectra)
@@ -26,7 +26,78 @@ library(ggrepel)
 library(data.table)
 ```
 
-## Import raw peptide table
+## 1. Read evidence.txt
 ```{r}
 library(data.table)
+evidence <- read_tsv("~/Documents/CoHOLSER/run004.2_summary/run004.2_summary/evidence.txt", show_col_types = FALSE)
 
+```
+
+## 2. Identify TMT reporter intensity columns
+```{r}
+tmt_cols <- grep("^Reporter intensity corrected", colnames(evidence), value = TRUE)
+
+## Optional: remove rows with all-zero reporter intensities
+evidence <- evidence[rowSums(as.matrix(evidence[, tmt_cols, with = FALSE])) > 0, ]
+
+```
+
+## 3. Build assay matrix
+```{r}
+assay_mat <- as.matrix(evidence[, tmt_cols, with = FALSE])
+mode(assay_mat) <- "numeric"
+```
+
+## Clean sample names
+```{r}
+colnames(assay_mat) <- str_replace(tmt_cols, "Reporter intensity corrected ", "TMT")
+
+```
+
+## 5. Build rowData
+
+```{r}
+row_data <- DataFrame(
+  Sequence        = evidence$Sequence,
+  ModifiedSeq     = evidence$`Modified sequence`,
+  Proteins        = evidence$Proteins,
+  LeadingProtein  = evidence$`Leading proteins`,
+  GeneNames       = evidence$`Gene names`,
+  Charge          = evidence$Charge,
+  PEP             = evidence$PEP,
+  Score           = evidence$Score,
+  RawFile         = evidence$`Raw file`,
+  Reverse         = evidence$Reverse,
+  Contaminant     = evidence$`Potential contaminant`
+)
+rownames(row_data) <- evidence$id
+```
+
+## 6. Build colData
+
+```{r}
+col_data <- DataFrame(TMT_channel = colnames(assay_mat))
+rownames(col_data) <- colnames(assay_mat)
+```
+
+## 7. Create SummarizedExperiment
+
+```{r}
+se <- SummarizedExperiment(
+  assays  = list(intensity = assay_mat),
+  rowData = row_data,
+  colData = col_data
+)
+```
+
+## 8. Convert to QFeatures
+```{r}
+qf <- QFeatures()
+qf[["psm"]] <- se
+
+```
+
+## Inspect
+```{r}
+qf
+```
