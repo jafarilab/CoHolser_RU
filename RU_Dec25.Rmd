@@ -24,22 +24,21 @@ library(limma)
 library(DEP)
 library(ggrepel)
 library(data.table)
+library(MsCoreUtils)
 ```
 
 ## 1. Read evidence.txt
 ```{r}
 library(data.table)
 evidence <- read_tsv("~/Documents/CoHOLSER/run004.2_summary/run004.2_summary/evidence.txt", show_col_types = FALSE)
-
+setDT(evidence)
 ```
 
 ## 2. Identify TMT reporter intensity columns
 ```{r}
+evidence <- evidence[(is.na(Reverse) | Reverse != "+") & (is.na(`Potential contaminant`) | `Potential contaminant` != "+")]
 tmt_cols <- grep("^Reporter intensity corrected", colnames(evidence), value = TRUE)
-
-## Optional: remove rows with all-zero reporter intensities
 evidence <- evidence[rowSums(as.matrix(evidence[, tmt_cols, with = FALSE])) > 0, ]
-
 ```
 
 ## 3. Build assay matrix
@@ -100,4 +99,316 @@ qf[["psm"]] <- se
 ## Inspect
 ```{r}
 qf
+summary(qf)
+class(qf)
+names(qf)
+colData(qf)
+rowData(qf)
+#rowDataNames(qf)
+# Access individual assays
+#assay(qf)
+anyNA(assay(qf))
 ```
+## 9. Normalize psm intensities
+```{r}
+## 1) Use raw intensities
+# Extract raw assay
+raw_assay <- assay(qf[["psm"]])
+
+# Ensure it's a matrix
+if (!is.matrix(raw_assay)) {
+  raw_assay <- as.matrix(raw_assay)
+}
+
+# Now calculate fractions
+frac_assay <- sweep(raw_assay, 2, colSums(raw_assay, na.rm = TRUE), FUN = "/")
+
+## 2) Convert each sample → fraction of its total
+frac_assay <- sweep(raw_assay, 2, colSums(raw_assay, na.rm = TRUE), FUN = "/")
+## 3) Scale fractions (optional)
+scaled_assay <- frac_assay * 1e6
+
+## Store new assay
+qf[["frac_psm"]] <- SummarizedExperiment(
+  assays  = list(intensity = scaled_assay),
+  rowData = rowData(qf[["psm"]]),
+  colData = colData(qf[["psm"]])
+)
+
+## Maintain assay links
+qf <- QFeatures::addAssayLinkOneToOne(qf, from="psm", to="frac_psm")
+
+# Extract assay
+frac_assay <- assay(qf[["frac_psm"]])
+
+# Add pseudocount to avoid log2(0)
+frac_assay_pc <- frac_assay + 1e-6
+
+# Store new assay
+qf[["frac_psm_pc"]] <- SummarizedExperiment(
+  assays  = list(intensity = frac_assay_pc),
+  rowData = rowData(qf[["frac_psm"]]),
+  colData = colData(qf[["frac_psm"]])
+)
+
+# Now log2-transform
+qf <- qf |>
+  logTransform(
+    i    = "frac_psm_pc",
+    name = "log_psm"
+  )
+qf <- QFeatures::addAssayLinkOneToOne(qf, from="frac_psm", to="log_psm")
+
+## 5) normalize (quantiles)
+qf <- QFeatures::normalize(
+  qf,
+  i    = "log_psm",
+  name = "norm_psm",
+  method = "quantiles"
+)
+
+qf <- QFeatures::addAssayLinkOneToOne(qf, from="log_psm", to="norm_psm")
+
+
+```
+
+## 10. Aggregation
+```{r}
+## --- Aggregate PSMs to peptides ---
+library(matrixStats)
+
+qf <- aggregateFeatures(
+  object = qf,
+  i    = "norm_psm",
+  fcol = "Sequence",   # your peptide mapping column
+  name = "peptide",
+  fun  = function(x) matrixStats::colMedians(x, na.rm = TRUE)
+)
+
+qf <- aggregateFeatures(
+  object = qf,
+  i    = "peptide",     # the assay you want to aggregate
+  fcol = "Proteins",          # change to your protein mapping column
+  name = "protein",          # name of new assay
+  fun  = function(x) matrixStats::colMedians(x, na.rm = TRUE)  # aggregation function
+)
+
+qf
+qf[["protein"]] |>
+  assay() |>
+  head()
+```
+## 11. Differential analysis
+```{r}
+library(S4Vectors)
+
+# TMT channel names
+sample_names <- colnames(qf[["peptide"]])
+
+# Define conditions in order of your TMT channels
+condition <- rep(c("Ru", "Ul", "RU", "Control", "Carrier"), each = 3)
+
+# Define biological replicates (1,2,3 for each condition)
+biorep <- rep(1:3, times = 5)
+
+# Combine into a DataFrame
+coldata <- DataFrame(
+  Condition = condition,
+  BioReplicate = biorep,
+  row.names = sample_names
+)
+
+# Assign to peptide assay
+colData(qf[["peptide"]]) <- coldata
+
+# Verify
+colData(qf[["peptide"]])
+```
+```{r}
+# rowData
+row_df <- as.data.frame(rowData(peptide_se))
+row_df$name <- row_df$Sequence  # protein grouping
+row_df$ID   <- paste0(row_df$Sequence, "_", seq_len(nrow(row_df))) # unique peptide ID
+
+# colData
+col_df <- as.data.frame(colData(peptide_se))
+col_df$label     <- rownames(col_df)
+col_df$condition <- col_df$Condition
+col_df$replicate <- col_df$BioReplicate
+
+# assay matrix
+assay_mat <- assay(peptide_se)
+
+# Combine row_df with assay matrix
+row_df <- cbind(row_df, assay_mat)
+
+# Intensity column indices
+columns <- (ncol(row_df) - ncol(assay_mat) + 1):ncol(row_df)
+
+# Make DEP SummarizedExperiment
+dep <- make_se(
+  row_df,
+  columns,
+  col_df
+)
+
+dep
+# Optional: impute missing values for downstream stats
+dep <- impute(dep, fun = "MinProb", q = 0.01)  # left-censored (low abundant) imputation
+# Specify the comparison: e.g., Ru vs Control
+dep <- test_diff(
+  dep,
+  type = "control",        # Control-based comparison
+  control = "Control"      # Name of the control condition
+)
+# Add significance calls (e.g., adj. p-value < 0.05 & |log2FC| > 1)
+dep <- add_rejections(
+  dep,
+  alpha = 0.001,      # significance threshold
+  lfc = 1            # log2 fold-change threshold
+)
+# Check the result table
+res <- get_results(dep)
+```
+```{r}
+library(dplyr)
+library(ComplexUpset)
+library(ggplot2)
+
+# Define thresholds
+pval_thresh <- 0.05
+ratio_thresh <- 2
+
+# Create logical columns for each comparison
+sig_df <- res %>%
+  mutate(
+    #Carrier_sig = (Carrier_vs_Control_p.val < pval_thresh) & (Carrier_vs_Control_ratio > ratio_thresh),
+    Ru_sig      = (Ru_vs_Control_p.val      < pval_thresh) & (Ru_vs_Control_ratio > ratio_thresh),
+    RU_sig      = (RU_vs_Control_p.val      < pval_thresh) & (RU_vs_Control_ratio > ratio_thresh),
+    Ul_sig      = (Ul_vs_Control_p.val      < pval_thresh) & (Ul_vs_Control_ratio > ratio_thresh)
+  ) %>%
+  select(name, #Carrier_sig, 
+         Ru_sig, RU_sig, Ul_sig) %>%
+  mutate(across(-name, ~ as.logical(.)))
+
+# 2️⃣ Join peptide data to protein info
+peptide_info <- as.data.frame(rowData(peptide_se)) %>%
+  select(Sequence, Proteins)  # peptide → protein mapping
+
+sig_df <- sig_df %>%
+  left_join(peptide_info, by = c("name" = "Sequence"))
+
+# 3️⃣ Collapse to protein-level significance
+protein_sig <- sig_df %>%
+  group_by(Proteins) %>%
+  summarise(
+    #Carrier_sig = any(Carrier_sig),
+    Ru_sig      = any(Ru_sig),
+    RU_sig      = any(RU_sig),
+    Ul_sig      = any(Ul_sig)
+  ) %>%
+  ungroup()
+
+# Filter only proteins that are significant in at least one comparison
+protein_sig <- protein_sig %>%
+  filter( Ru_sig | RU_sig | Ul_sig)
+
+# Minimal theme to avoid deprecated warnings
+my_theme <- theme_minimal() +
+  theme(
+    axis.title.x = element_text(),
+    axis.title.y = element_text(),
+    legend.position = "right"
+  )
+
+# Make UpSet plot
+png("upset_plot.png", width = 1200, height = 800)
+upset(
+  protein_sig,
+  names(protein_sig)[-1],  # comparison columns
+  width_ratio = 0.1,
+  name = "Significant proteins",
+  min_size = 1,
+  themes = my_theme
+)
+dev.off()
+
+```
+
+```{r}
+# protein_sig has columns: Proteins, Carrier_sig, Ru_sig, RU_sig, Ul_sig
+# Keep only logical/significance columns + protein name
+sig_sets <- protein_sig %>%
+  select(Proteins, Ru_sig, RU_sig, Ul_sig)
+
+# Convert to long format for intersections
+long_sig <- sig_sets %>%
+  pivot_longer(
+    cols = -Proteins,
+    names_to = "Comparison",
+    values_to = "Significant"
+  ) %>%
+  filter(Significant)
+
+# Create a list: one element per combination of sets
+intersections <- long_sig %>%
+  group_by(Proteins) %>%
+  summarise(Sets = paste(sort(Comparison), collapse = "_")) %>%
+  group_by(Sets) %>%
+  summarise(Proteins = list(Proteins)) %>%
+  deframe()  # produces a named list: names = intersection, values = vector of proteins
+
+# Check
+intersections
+
+
+```
+
+```{r}
+library(httr)
+library(jsonlite)
+library(dplyr)
+
+# Your protein list (split multi-IDs first)
+ids <- c(
+  "O00160","O75368","P07900","P08238","P11142","P54652","P18085",
+  "P23141","P26038","P15311","P35241","P35579","P35580","P35637",
+  "Q92804","P50990","P50991","P62277","P62753","P78371","Q01130",
+  "Q9BRL6","Q9UBE0"
+)
+
+# UniProt REST query
+base_url <- "https://rest.uniprot.org/uniprotkb/search?"
+fields   <- "accession,protein_name,gene_names"
+query    <- paste0("accession:", ids, collapse = " OR ")
+
+url <- paste0(
+  base_url,
+  "query=", URLencode(query),
+  "&fields=", URLencode(fields),
+  "&format=json"
+)
+
+resp <- GET(url)
+stop_for_status(resp)
+
+content_json <- content(resp, as = "text", encoding = "UTF-8")
+parsed <- fromJSON(content_json, flatten = TRUE)
+
+# Safely extract gene names
+gene_names <- sapply(parsed$results$genes, function(x) {
+  if(length(x) == 0) return(NA)
+  # extract geneName.value; collapse if multiple
+  paste(sapply(x$geneName.value, function(y) ifelse(is.null(y), NA, y)), collapse = ";")
+})
+
+# Construct tibble
+uniprot_df <- tibble(
+  accession    = sapply(parsed$results$primaryAccession, identity),
+  protein_name = sapply(parsed$results$proteinDescription.recommendedName.fullName.value, identity),
+  gene_names   = gene_names
+)
+
+uniprot_df
+```
+
